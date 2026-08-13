@@ -9,6 +9,10 @@
 CVE_PRODUCT ??= "${BPN}"
 CVE_VERSION ??= "${PV}"
 
+# Defines SBOM_CVE_CHECK_DEPLOY_DB_DIR, used by the kernel CVE filtering below
+# to find the cvelist database deployed by sbom-cve-check-update-cvelist-native.
+require conf/sbom-cve-check-config.inc
+
 # CycloneDX specification version to generate
 # Options: "1.4", "1.6", "1.7"
 # Version 1.4: Legacy format for compatibility with older tools
@@ -31,6 +35,16 @@ CYCLONEDX_ADD_VULN_TIMESTAMPS ??= "1"
 # State to assign to unpatched vulnerabilities.
 # Can be empty to omit the state field.
 CYCLONEDX_UNPATCHED_VULNS_STATE ??= "in_triage"
+
+# Add "not_affected" VEX entries for kernel CVEs whose affected files were
+# never compiled (based on the actual compiled sources, read from
+# debugsources info produced by do_package).
+# Only applies to whichever recipe provides virtual/kernel.
+CYCLONEDX_VEX_ADD_KERNEL_CVE ??= "0"
+
+# Keep the kernel CVE database fresh instead of pinned to the recipe's
+# default SRCREV.
+SRCREV:pn-sbom-cve-check-update-cvelist-native = "${AUTOREV}"
 
 CYCLONEDX_RUNTIME_PACKAGES_ONLY ??= "1"
 
@@ -101,6 +115,15 @@ python () {
 
     if d.getVar("CYCLONEDX_INCLUDE_UNPATCHED_VULNS") == "1":
         bb.warn(f"meta-cyclonedx: Option CYCLONEDX_INCLUDE_UNPATCHED_VULNS has been removed post-Wrynose")
+}
+
+python () {
+    if d.getVar('CYCLONEDX_VEX_ADD_KERNEL_CVE') != '1':
+        return
+    if d.getVar('PN') != d.getVar('PREFERRED_PROVIDER_virtual/kernel'):
+        return
+    d.appendVarFlag('do_populate_cyclonedx', 'depends',
+                     ' sbom-cve-check-update-cvelist-native:do_patch')
 }
 
 # Clean out buildtime dir to prepare for creating complete list of build-time package information
@@ -206,6 +229,65 @@ python do_populate_cyclonedx() {
 
     pn_list["dependencies"] = dependencies
 
+    # Add "not_affected" VEX entries for kernel CVEs whose affected files were
+    # never compiled, based on the sources actually compiled for this kernel
+    # (only applies to whichever recipe provides virtual/kernel).
+    if (d.getVar('CYCLONEDX_VEX_ADD_KERNEL_CVE') == '1'
+            and pn == d.getVar('PREFERRED_PROVIDER_virtual/kernel')):
+        # NOTE: "os" is intentionally not imported here. This function relies
+        # on the "os" bitbake injects globally without importing it itself
+        # (see the os.path.join() call above); shadowing it with a local
+        # import would make Python treat "os" as local to the whole function
+        # and break that earlier call with an UnboundLocalError.
+        import importlib.util
+        import oe.spdx_common
+
+        # Reuse oe-core's own CVE-vs-compiled-files matching logic instead
+        # of duplicating its CPE/version-range parsing.
+        script = os.path.join(d.getVar('COREBASE'), 'scripts', 'contrib',
+                               'improve_kernel_cve_report.py')
+        spec = importlib.util.spec_from_file_location('improve_kernel_cve_report', script)
+        ikcr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ikcr)
+
+        # get_compiled_sources() returns kernel paths prefixed with "${BP}/"
+        # (see save_debugsources_info() in oe/package.py); strip that first
+        # path component to match the plain kernel-relative paths used by
+        # CVE records' "programFiles" -- same normalization
+        # improve_kernel_cve_report.py itself applies in
+        # read_spdx3()/read_debugsources().
+        compiled_files_raw, _ = oe.spdx_common.get_compiled_sources(d)
+        compiled_files = {src[src.find('/') + 1:] for src in compiled_files_raw}
+        datadir = d.expand('${SBOM_CVE_CHECK_DEPLOY_DB_DIR}/cvelist')
+        # Same version normalization used above for this same recipe's SBOM
+        # component.
+        pv = ikcr.Version(version.split('+git')[0])
+
+        kernel_cves = ikcr.get_kernel_cves(datadir, compiled_files, pv)
+
+        existing_ids = {c['id'] for c in cves}
+        bom_refs = [pkg['bom-ref'] for pkg in pn_list['pkgs']]
+        placeholder = d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER')
+
+        added = 0
+        for cve_id, entry in kernel_cves.items():
+            if entry.get('status') != 'Ignored' or entry.get('detail') != 'not-applicable-config':
+                continue
+            if cve_id in existing_ids:
+                continue
+            cves.append({
+                'id': cve_id,
+                'source': {'name': 'NVD', 'url': f'https://nvd.nist.gov/vuln/detail/{cve_id}'},
+                'analysis': {
+                    'state': 'not_affected',
+                    'justification': 'code_not_present',
+                    'detail': entry.get('description', ''),
+                },
+                'affects': [{'ref': f"urn:cdx:{placeholder}/1#{ref}"} for ref in bom_refs],
+            })
+            added += 1
+        bb.note(f"cyclonedx-export: added {added} not_affected kernel CVE entries")
+
     # write partial sbom to the recipes work folder
     write_json(os.path.join(d.getVar("CYCLONEDX_PNDATA_WORKDIR"), f"{pn}.json"), pn_list)
 
@@ -213,7 +295,7 @@ python do_populate_cyclonedx() {
         Path(os.path.join(d.getVar("CYCLONEDX_BUILDTIME_DIR"), pn)).touch()
 }
 
-addtask do_populate_cyclonedx before do_build
+addtask do_populate_cyclonedx before do_build after do_package do_packagedata
 do_populate_cyclonedx[cleandirs] = "${CYCLONEDX_PNDATA_WORKDIR}"
 do_populate_cyclonedx[vardeps] += "CVE_STATUS"
 SSTATETASKS += "do_populate_cyclonedx"
